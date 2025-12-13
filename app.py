@@ -19,7 +19,7 @@ def extract_names_from_chunk(names_chunk, api_key):
         
         # En hızlı ve ucuz model: Flash
         model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+            model_name='gemini-2.5-flash',
             generation_config={"response_mime_type": "application/json"}
         )
 
