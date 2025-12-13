@@ -6,43 +6,58 @@ import time
 import io
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="TurkDetect - GPT-4o-mini", layout="wide")
+st.set_page_config(page_title="TurkDetect Pro - Strict Mode", layout="wide")
 
-# --- OPENAI ANALİZ FONKSİYONU ---
+# --- OPENAI ANALİZ FONKSİYONU (GÜNCELLENDİ) ---
 def extract_names_openai(names_chunk, api_key):
     """
-    İsim listesini GPT-4o-mini'ye gönderir ve Türk olanları JSON formatında alır.
+    İsim listesini GPT-4o-mini'ye gönderir.
+    Çok sıkı kurallarla SADECE Türkiye Türklerini filtreler.
     """
     client = OpenAI(api_key=api_key)
     
+    # --- KRİTİK BÖLÜM: GELİŞTİRİLMİŞ PROMPT ---
     system_prompt = """
-    You are a strictly deterministic classifier specialized in demographics.
-    Your task is to identify people of TURKISH origin based on their names from a given list.
+    You are a highly strict demographic classifier focused ONLY on identifying people from TURKEY (Turkish Republic context).
     
-    Rules:
-    1. Analyze both First Name and Last Name together for context.
-    2. Detect Turkish characters (ş, ğ, ü, ö, ç, ı) even if anglicized (s, g, u, o, c, i).
-    3. Look for linguistic roots and suffixes (-oglu, -kaya, -er, -sen, etc.).
-    4. Be strict: Exclude common international names unless the surname is distinctly Turkish.
+    YOUR GOAL:
+    Filter out names that are strictly Turkish. You must distinguish between "General Islamic/Arabic names" and "Turkish names".
+
+    STRICT RULES FOR VALIDATION:
+    1. **Spelling Matters:** - REJECT "Mohammed", "Muhammad", "Ahmad", "Omar". 
+       - ACCEPT "Mehmet", "Muhammet", "Ahmet", "Omer".
+       - Turks use specific variations (e.g., "Ayse" instead of "Aisha", "Hatice" instead of "Khadija").
     
-    Output Format:
-    Return a valid JSON object with a key "turkish_names" containing the array of identified full names.
+    2. **Surname Dependency:**
+       - If a First Name is common/ambiguous (like "Ali", "Can", "Sara", "Deniz"), the Last Name MUST be undeniably Turkish (e.g., Yilmaz, Ozturk, Kaya, Demir, Sahin).
+       - REJECT pairs like "Ali Khan", "Mohammed Asharaf", "Sara Smith".
+    
+    3. **Exclude Non-Turkish Origins:**
+       - Exclude Arab, Persian, Kurdish-only, or Central Asian naming conventions unless they strictly fit the Turkey context.
+       - REJECT surnames typically ending in "-ov", "-ev", "-zad", "-zai" unless common in Turkey.
+       
+    4. **Turkish Surnames:**
+       - Look for words with clear Turkish meaning or suffixes: -oglu, -gil, -er, -sen, -soy, -tas, -tepe, -kaya.
+       - Common words: Demir, Celik, Yildiz, Yilmaz, Aydin, Arslan.
+
+    Input: A list of full names.
+    Output: A JSON object with a key "turkish_names" containing strictly validated Full Names.
     """
 
     user_prompt = f"""
-    Analyze this list of names and extract the Turkish ones:
+    Analyze this list. Be extremely selective. Only keep names that look like a native citizen of Turkey:
     {json.dumps(names_chunk)}
     """
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # En hızlı ve maliyet etkin model
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            response_format={"type": "json_object"}, # Kesin JSON garantisi
-            temperature=0 # Deterministik olması için
+            response_format={"type": "json_object"},
+            temperature=0 # Sıfır yaratıcılık, tam determinizm.
         )
         
         content = response.choices[0].message.content
@@ -54,21 +69,22 @@ def extract_names_openai(names_chunk, api_key):
         return []
 
 # --- ARAYÜZ (UI) ---
-st.title("🇹🇷 TurkDetect | GPT-4o-mini")
+st.title("🇹🇷 TurkDetect | Ultra-Strict Mode")
 st.markdown("""
-Bu araç, OpenAI'nin en hızlı modeli **GPT-4o-mini**'yi kullanarak CSV dosyasındaki 
-Türk isimlerini tespit eder.
+Bu versiyon **GPT-4o-mini** kullanır ve **çok sıkı** bir filtreleme uygular. 
+*Mohammed Asharaf* gibi Arapça kökenli isimleri eler, sadece Türkiye formatındaki (*Mehmet, Ahmet*) yazımları ve Türkçe soyisim kombinasyonlarını kabul eder.
 """)
 
 # Sidebar
 with st.sidebar:
     st.header("🔑 Ayarlar")
     api_key = st.text_input("OpenAI API Key", type="password", help="platform.openai.com adresinden alabilirsiniz.")
-    st.info("Not: Bu uygulama GPT-4o-mini modelini kullanır. Çok ucuzdur ancak API bakiyeniz olması gerekir.")
+    st.info("Bu mod daha seçicidir. Listede azalma olabilir ama doğruluk artar.")
     
     st.markdown("---")
     st.subheader("⚡ Hız Ayarı")
-    batch_size = st.slider("Paket Boyutu (Batch Size)", 20, 100, 50, help="Tek seferde AI'ya sorulacak isim sayısı.")
+    # Batch size'ı biraz düşürdük ki model daha dikkatli baksın
+    batch_size = st.slider("Paket Boyutu", 10, 80, 40, help="Daha düşük sayı = Daha dikkatli analiz.")
 
 # Ana Ekran
 col1, col2 = st.columns([1, 2])
@@ -91,7 +107,7 @@ with col1:
             df['Full_Name_Temp'] = df[fname_col].astype(str) + " " + df[lname_col].astype(str)
             all_names = df['Full_Name_Temp'].tolist()
             
-            if st.button("🚀 Analizi Başlat"):
+            if st.button("🚀 Seçici Analizi Başlat"):
                 identified_turkish_names = []
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -110,10 +126,9 @@ with col1:
                     current_batch = (i // batch_size) + 1
                     prog = min(current_batch / total_batches, 1.0)
                     progress_bar.progress(prog)
-                    status_text.text(f"İşleniyor: {current_batch}/{total_batches} Paket | Bulunan: {len(identified_turkish_names)}")
+                    status_text.text(f"Taranıyor: {current_batch}/{total_batches} Paket | Bulunan Türk: {len(identified_turkish_names)}")
                     
-                    # OpenAI çok hızlıdır, rate limit yoksa sleep gerekmez ama güvenlik için:
-                    time.sleep(0.1)
+                    time.sleep(0.1) # API nezaketi
 
                 duration = time.time() - start_time
                 st.success(f"İşlem {duration:.2f} saniyede tamamlandı.")
@@ -123,7 +138,7 @@ with col1:
                 result_df = df[df['Full_Name_Temp'].isin(turkish_set)].copy()
                 result_df.drop(columns=['Full_Name_Temp'], inplace=True)
                 
-                st.session_state['results_gpt'] = result_df
+                st.session_state['results_strict'] = result_df
 
         else:
             st.error("CSV dosyasında 'First Name' ve 'Last Name' kolonları bulunamadı.")
@@ -131,21 +146,21 @@ with col1:
         st.warning("Lütfen OpenAI API anahtarınızı giriniz.")
 
 # Sonuç Ekranı
-if 'results_gpt' in st.session_state:
-    res = st.session_state['results_gpt']
+if 'results_strict' in st.session_state:
+    res = st.session_state['results_strict']
     with col2:
-        st.subheader("🎯 Sonuçlar")
-        st.info(f"Toplam {len(res)} Türk kişi bulundu.")
+        st.subheader("🎯 Filtrelenmiş Sonuçlar")
+        st.info(f"Toplam {len(res)} kişi, Türkiye standartlarına göre doğrulandı.")
         st.dataframe(res, height=600)
         
         # Excel İndir
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            res.to_excel(writer, index=False, sheet_name='Turkish Leads')
+            res.to_excel(writer, index=False, sheet_name='Strict Turkish Leads')
             
         st.download_button(
-            label="📥 Excel İndir",
+            label="📥 Excel İndir (Strict Mode)",
             data=buffer.getvalue(),
-            file_name="gpt4o_mini_leads.xlsx",
+            file_name="turkish_leads_strict.xlsx",
             mime="application/vnd.ms-excel"
         )
