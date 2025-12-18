@@ -16,88 +16,37 @@ def extract_names_openai(names_chunk, api_key):
     """
     client = OpenAI(api_key=api_key)
     
-    # --- KRİTİK BÖLÜM: GELİŞTİRİLMİŞ PROMPT (V2 - %95 Precision) ---
+    # --- KRİTİK BÖLÜM: GELİŞTİRİLMİŞ PROMPT ---
     system_prompt = """
-You are a STRICT Turkey-Turkish name classifier. Your ONLY task is to decide if a given full name (first+last) is MOST LIKELY a native Turkish citizen-style Turkish name/surname pair used in Turkey (Republic of Türkiye context).
+    You are a highly strict demographic classifier focused ONLY on identifying people from TURKEY (Turkish Republic context).
+    
+    YOUR GOAL:
+    Filter out names that are strictly Turkish. You must distinguish between "General Islamic/Arabic names" and "Turkish names".
 
-You MUST be conservative: if unsure, REJECT.
-Goal: achieve ~95% precision for “Turkey Turkish names”, not recall.
+    STRICT RULES FOR VALIDATION:
+    1. **Spelling Matters:** - REJECT "Mohammed", "Muhammad", "Ahmad", "Omar". 
+       - ACCEPT "Mehmet", "Muhammet", "Ahmet", "Omer".
+       - Turks use specific variations (e.g., "Ayse" instead of "Aisha", "Hatice" instead of "Khadija").
+    
+    2. **Surname Dependency:**
+       - If a First Name is common/ambiguous (like "Ali", "Can", "Sara", "Deniz"), the Last Name MUST be undeniably Turkish (e.g., Yilmaz, Ozturk, Kaya, Demir, Sahin).
+       - REJECT pairs like "Ali Khan", "Mohammed Asharaf", "Sara Smith".
+    
+    3. **Exclude Non-Turkish Origins:**
+       - Exclude Arab, Persian, Kurdish-only, or Central Asian naming conventions unless they strictly fit the Turkey context.
+       - REJECT surnames typically ending in "-ov", "-ev", "-zad", "-zai" unless common in Turkey.
+       
+    4. **Turkish Surnames:**
+       - Look for words with clear Turkish meaning or suffixes: -oglu, -gil, -er, -sen, -soy, -tas, -tepe, -kaya.
+       - Common words: Demir, Celik, Yildiz, Yilmaz, Aydin, Arslan.
 
-INPUT: A list of full name strings (may include middle names).
-OUTPUT: Return ONLY ONE JSON object:
-{
-  "turkish_names": [ ... ],
-  "rejected_names": [
-    {"name":"...", "reason_codes":["..."], "confidence":0.00-1.00}
-  ]
-}
-
---------------------------------------------
-NORMALIZATION (do this mentally before judging)
-- Trim spaces, collapse repeated spaces.
-- Keep Turkish letters if present: ÇĞİÖŞÜ (strong Turkey signal).
-- Also generate ASCII variant (Ç->C, Ğ->G, İ->I, Ö->O, Ş->S, Ü->U).
-- Tokenize by spaces and hyphens.
-- Assume LAST token is surname unless there is a clear suffix like “oğlu/oglu” etc (still surname).
-- If the string looks like company/org or contains symbols/emails/handles, REJECT.
-
---------------------------------------------
-HARD REJECTION RULES (IMMEDIATE REJECT)
-R0) Non-person patterns: contains @, http, LLC, FZ-LLC, Inc, Ltd, Company, “Trading”, or mostly uppercase codes -> REJECT.
-R1) CLEAR NON-TURKISH SURNAME MORPHOLOGY:
-   - Surname ends with: -ov, -ova, -ev, -eva, -sky, -ski, -ska, -szky, -wicz, -vich, -vici, -son (as in Johnson), -sen (as in Andersen), -dottir, -ez (Spanish like Martinez) -> REJECT.
-R2) CLEAR ARABIC/PERSIAN/SOUTH ASIAN FULL-PAIR SIGNATURE:
-   - Presence of: bin, bint, ibn, al-, el-, abd, abu, umm, sheikh as name part -> REJECT.
-   - Surnames like Khan, Singh, Patel, Sharma, Gupta -> REJECT.
-R3) First-name spelling is Arabic/English variant where Turkish variant exists:
-   - REJECT: Mohammed, Muhammad, Mohamed, Ahmad, Ahmed (if not “Ahmet”), Omar (if not “Ömer/Omer”), Aisha, Khadija, Fatimah, Youssef.
-   - ACCEPT Turkish spellings: Mehmet, Muhammet, Ahmet, Ömer/Omer, Ayşe/Ayse, Hatice, Fatma, Mustafa, İbrahim/Ibrahim, Yusuf.
-   If Arabic transliteration is present and surname is not extremely Turkish -> REJECT.
-R4) Obvious Western first+last pair (e.g., Sara Smith, John Brown, Maria Garcia) -> REJECT.
-
---------------------------------------------
-STRONG ACCEPTANCE SIGNALS
-A1) Turkish diacritics present (ÇĞİÖŞÜ) in any token -> strong +.
-A2) Surname has typical Turkish suffix/structure:
-   -oğlu/oglu, -soy, -öz/-oz, -kaya, -tepe, -dağ/dag, -demir, -çelik/celik, -yıldız/yildiz, -yılmaz/yilmaz, -şahin/sahin, -arslan, -aydın/aydin, -güneş/gunes, -öztürk/ozturk, -özkan/ozkan, -aktaş/aktas, -toprak, -polat, -doğan/dogan, -koç/koc, -kurt, -bulut, -kılıç/kilic.
-A3) First name is strongly Turkey-common:
-   Mehmet, Ahmet, Mustafa, Hüseyin, Hasan, İbrahim/Ibrahim, Yusuf, Ömer/Omer, Murat, Emre, Kerem, Kaan, Berk, Burak, Oğuz/Oguz, Ozan, Serkan, Onur, Volkan, Tolga, Barış/Baris,
-   Ece, Elif, Zeynep, Merve, Kübra/Kubra, Esra, Sıla/Sila, Ceren, Gül/Gul, Gülşah/Gulsah, Büşra/Busra, Ayşe/Ayse, Fatma, Hatice, Hande, Seda.
-
---------------------------------------------
-AMBIGUOUS NAMES POLICY (to stop leaks)
-If the FIRST NAME is ambiguous/international/Islamic-common (Ali, Sara, Maryam, Adam, Deniz, Can, Derya, Lina, Noor, Hana, Yusuf, Ibrahim):
-- ACCEPT ONLY if surname has Turkish diacritics (A1) OR matches whitelist OR clearly matches Turkish suffix/structure (A2).
-- Otherwise REJECT.
-
---------------------------------------------
-TOP TURKISH SURNAME WHITELIST (high precision)
-If surname EXACT MATCH (ASCII or Turkish):
-Yılmaz/Yilmaz, Kaya, Demir, Şahin/Sahin, Çelik/Celik, Yıldız/Yildiz, Yıldırım/Yildirim, Öztürk/Ozturk, Aydın/Aydin, Arslan, Doğan/Dogan, Kılıç/Kilic, Aslan, Karaca, Koç/Koc, Kurt, Özdemir/Ozdemir, Polat, Aktaş/Aktas, Güneş/Gunes, Bulut, Toprak, Gür/Gur, Taş/Tas, Erdem, Uçar/Ucar, Kaplan, Keskin, Avcı/Avci.
-
---------------------------------------------
-DECISION SCORING (deterministic)
-Start score = 0.0
-+0.55 if A1 (any Turkish diacritic)
-+0.35 if surname matches whitelist
-+0.25 if surname matches Turkish suffix/meaning pattern (A2)
-+0.20 if first name strongly Turkey-common (A3)
--0.25 if first name is ambiguous and surname is NOT (A1 or whitelist or A2)
-
-ACCEPT if score >= 0.60 AND no hard rejection fired.
-Otherwise REJECT.
-
---------------------------------------------
-REASON CODES (use for rejected_names)
-TR_DIACRITIC, TR_SURNAME_WHITELIST, TR_SURNAME_SUFFIX, TR_FIRSTNAME_STRONG,
-AMBIGUOUS_FIRSTNAME_NEEDS_SURNAME, NONTR_SURNAME_MORPH, ARABIC_PARTICLE, WESTERN_PAIR, ARABIC_SPELLING_VARIANT
-
-Return ONLY JSON. No extra text.
+    Input: A list of full names.
+    Output: A JSON object with a key "turkish_names" containing strictly validated Full Names.
     """
 
     user_prompt = f"""
-Analyze this list. Be extremely selective. Only keep names that look like a native citizen of Turkey:
-{json.dumps(names_chunk)}
+    Analyze this list. Be extremely selective. Only keep names that look like a native citizen of Turkey:
+    {json.dumps(names_chunk)}
     """
 
     try:
@@ -108,13 +57,11 @@ Analyze this list. Be extremely selective. Only keep names that look like a nati
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0  # Sıfır yaratıcılık, tam determinizm.
+            temperature=0 # Sıfır yaratıcılık, tam determinizm.
         )
         
         content = response.choices[0].message.content
         result = json.loads(content)
-
-        # Geriye dönük uyumluluk: eski arayüz sadece turkish_names bekliyor.
         return result.get("turkish_names", [])
 
     except Exception as e:
