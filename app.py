@@ -1,166 +1,324 @@
 import streamlit as st
 import pandas as pd
-from openai import OpenAI
+import requests
 import json
-import time
 import io
+from urllib.parse import urlparse
+from openai import OpenAI
 
-# --- SAYFA AYARLARI ---
-st.set_page_config(page_title="TurkDetect Pro - Strict Mode", layout="wide")
+# -----------------------------
+# PAGE
+# -----------------------------
+st.set_page_config(
+    page_title="AI Sales Hunter (Domain + Apollo Match)",
+    page_icon="🌐",
+    layout="wide"
+)
 
-# --- OPENAI ANALİZ FONKSİYONU (GÜNCELLENDİ) ---
-def extract_names_openai(names_chunk, api_key):
-    """
-    İsim listesini GPT-4o-mini'ye gönderir.
-    Çok sıkı kurallarla SADECE Türkiye Türklerini filtreler.
-    """
-    client = OpenAI(api_key=api_key)
-    
-    # --- KRİTİK BÖLÜM: GELİŞTİRİLMİŞ PROMPT ---
-    system_prompt = """
-    You are a highly strict demographic classifier focused ONLY on identifying people from TURKEY (Turkish Republic context).
-    
-    YOUR GOAL:
-    Filter out names that are strictly Turkish. You must distinguish between "General Islamic/Arabic names" and "Turkish names".
+st.title("🌐 B2B Sales Agent: Domain Discovery + Apollo Match")
+st.markdown("1) Google/Serper ile LinkedIn bul → 2) GPT ile kişi/şirket ayıkla → 3) Domain bul → 4) Apollo Match ile email enrich")
 
-    STRICT RULES FOR VALIDATION:
-    1. **Spelling Matters:** - REJECT "Mohammed", "Muhammad", "Ahmad", "Omar". 
-       - ACCEPT "Mehmet", "Muhammet", "Ahmet", "Omer".
-       - Turks use specific variations (e.g., "Ayse" instead of "Aisha", "Hatice" instead of "Khadija").
-    
-    2. **Surname Dependency:**
-       - If a First Name is common/ambiguous (like "Ali", "Can", "Sara", "Deniz"), the Last Name MUST be undeniably Turkish (e.g., Yilmaz, Ozturk, Kaya, Demir, Sahin).
-       - REJECT pairs like "Ali Khan", "Mohammed Asharaf", "Sara Smith".
-    
-    3. **Exclude Non-Turkish Origins:**
-       - Exclude Arab, Persian, Kurdish-only, or Central Asian naming conventions unless they strictly fit the Turkey context.
-       - REJECT surnames typically ending in "-ov", "-ev", "-zad", "-zai" unless common in Turkey.
-       
-    4. **Turkish Surnames:**
-       - Look for words with clear Turkish meaning or suffixes: -oglu, -gil, -er, -sen, -soy, -tas, -tepe, -kaya.
-       - Common words: Demir, Celik, Yildiz, Yilmaz, Aydin, Arslan.
+# -----------------------------
+# SIDEBAR
+# -----------------------------
+with st.sidebar:
+    st.header("⚙️ Konfigürasyon")
 
-    Input: A list of full names.
-    Output: A JSON object with a key "turkish_names" containing strictly validated Full Names.
-    """
+    st.subheader("1) API Keys")
+    openai_api_key = st.text_input("OpenAI API Key", type="password")
+    serper_api_key = st.text_input("Serper (Google) API Key", type="password")
+    apollo_api_key = st.text_input("Apollo.io API Key", type="password")
 
-    user_prompt = f"""
-    Analyze this list. Be extremely selective. Only keep names that look like a native citizen of Turkey:
-    {json.dumps(names_chunk)}
-    """
+    st.divider()
+
+    st.subheader("2) Hedef Kitle")
+    target_position = st.text_input("Ünvan", "Quality Assurance Manager")
+    target_industry = st.text_input("Sektör", "Pharma")
+    target_location = st.text_input("Lokasyon", "Dubai")
+    search_limit = st.slider("Sonuç Sayısı", 5, 20, 10)
+
+    st.divider()
+
+    st.subheader("3) Apollo Reveal Ayarları")
+    reveal_personal_emails = st.toggle("Kişisel emailleri reveal etmeyi dene", value=False)
+    reveal_phone_number = st.toggle("Telefon reveal etmeyi dene", value=False)
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+SERPER_URL = "https://google.serper.dev/search"
+APOLLO_MATCH_URL = "https://api.apollo.io/api/v1/people/match"
+
+
+def safe_post(url: str, headers: dict, payload: dict | None = None, params: dict | None = None, timeout: int = 30):
+    """requests.post wrapper with basic error handling."""
+    r = requests.post(url, headers=headers, json=payload, params=params, timeout=timeout)
+    # Apollo bazen non-200 döner, burada body'yi yakalamak faydalı
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    return r.status_code, data
+
+
+def google_search_linkedin(position: str, industry: str, location: str, api_key: str, num_results: int):
+    """Serper üzerinden Google'da LinkedIn profilleri arar."""
+    query = f'site:linkedin.com/in/ "{position}" "{industry}" "{location}"'
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+    payload = {"q": query, "num": num_results}
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0 # Sıfır yaratıcılık, tam determinizm.
-        )
-        
-        content = response.choices[0].message.content
-        result = json.loads(content)
-        return result.get("turkish_names", [])
-
+        status, data = safe_post(SERPER_URL, headers=headers, payload=payload, timeout=30)
+        if status >= 400:
+            return {"error": f"Serper HTTP {status}", "details": data}
+        return data
     except Exception as e:
-        st.error(f"OpenAI API Hatası: {e}")
-        return []
+        return {"error": str(e)}
 
-# --- ARAYÜZ (UI) ---
-st.title("🇹🇷 TurkDetect | Ultra-Strict Mode")
-st.markdown("""
-Bu versiyon **GPT-4o-mini** kullanır ve **çok sıkı** bir filtreleme uygular. 
-*Mohammed Asharaf* gibi Arapça kökenli isimleri eler, sadece Türkiye formatındaki (*Mehmet, Ahmet*) yazımları ve Türkçe soyisim kombinasyonlarını kabul eder.
-""")
 
-# Sidebar
-with st.sidebar:
-    st.header("🔑 Ayarlar")
-    api_key = st.text_input("OpenAI API Key", type="password", help="platform.openai.com adresinden alabilirsiniz.")
-    st.info("Bu mod daha seçicidir. Listede azalma olabilir ama doğruluk artar.")
-    
-    st.markdown("---")
-    st.subheader("⚡ Hız Ayarı")
-    # Batch size'ı biraz düşürdük ki model daha dikkatli baksın
-    batch_size = st.slider("Paket Boyutu", 10, 80, 40, help="Daha düşük sayı = Daha dikkatli analiz.")
+def clean_domain_from_url(link: str) -> str | None:
+    """https://www.nestle.com/jobs -> nestle.com"""
+    if not link:
+        return None
+    try:
+        parsed = urlparse(link)
+        if not parsed.netloc:
+            return None
+        return parsed.netloc.replace("www.", "")
+    except Exception:
+        return None
 
-# Ana Ekran
-col1, col2 = st.columns([1, 2])
 
-with col1:
-    st.subheader("📁 Veri Yükleme")
-    uploaded_file = st.file_uploader("CSV Dosyası (Max 50k Satır)", type=["csv"])
+def find_company_domain(company_name: str, serper_key: str) -> str | None:
+    """Şirket isminden domain bulur (serper)."""
+    if not company_name or company_name == "Bilinmiyor":
+        return None
 
-    if uploaded_file and api_key:
-        df = pd.read_csv(uploaded_file)
-        
-        # Kolonları Otomatik Bul
-        fname_col = next((c for c in df.columns if c.lower() in ['first name', 'firstname', 'ad', 'name']), None)
-        lname_col = next((c for c in df.columns if c.lower() in ['last name', 'lastname', 'soyad', 'surname']), None)
+    query = f'{company_name} official website'
+    headers = {"X-API-KEY": serper_key, "Content-Type": "application/json"}
+    payload = {"q": query, "num": 3}
 
-        if fname_col and lname_col:
-            st.success(f"✅ Dosya doğrulandı: {len(df)} satır.")
-            
-            # Geçici Tam İsim Kolonu
-            df['Full_Name_Temp'] = df[fname_col].astype(str) + " " + df[lname_col].astype(str)
-            all_names = df['Full_Name_Temp'].tolist()
-            
-            if st.button("🚀 Seçici Analizi Başlat"):
-                identified_turkish_names = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                total_batches = (len(all_names) + batch_size - 1) // batch_size
-                
-                start_time = time.time()
-                
-                for i in range(0, len(all_names), batch_size):
-                    batch = all_names[i : i + batch_size]
-                    
-                    found = extract_names_openai(batch, api_key)
-                    identified_turkish_names.extend(found)
-                    
-                    # İlerleme
-                    current_batch = (i // batch_size) + 1
-                    prog = min(current_batch / total_batches, 1.0)
-                    progress_bar.progress(prog)
-                    status_text.text(f"Taranıyor: {current_batch}/{total_batches} Paket | Bulunan Türk: {len(identified_turkish_names)}")
-                    
-                    time.sleep(0.1) # API nezaketi
+    try:
+        status, data = safe_post(SERPER_URL, headers=headers, payload=payload, timeout=30)
+        if status >= 400:
+            return None
+        organic = data.get("organic", [])
+        if not organic:
+            return None
 
-                duration = time.time() - start_time
-                st.success(f"İşlem {duration:.2f} saniyede tamamlandı.")
-                
-                # Sonuçları Filtrele
-                turkish_set = set(identified_turkish_names)
-                result_df = df[df['Full_Name_Temp'].isin(turkish_set)].copy()
-                result_df.drop(columns=['Full_Name_Temp'], inplace=True)
-                
-                st.session_state['results_strict'] = result_df
+        # İlk sonucu al ama istersen birkaçını kontrol edip en iyi domaini seçebilirsin
+        link = organic[0].get("link", "")
+        return clean_domain_from_url(link)
+    except Exception:
+        return None
 
-        else:
-            st.error("CSV dosyasında 'First Name' ve 'Last Name' kolonları bulunamadı.")
-    elif uploaded_file and not api_key:
-        st.warning("Lütfen OpenAI API anahtarınızı giriniz.")
 
-# Sonuç Ekranı
-if 'results_strict' in st.session_state:
-    res = st.session_state['results_strict']
-    with col2:
-        st.subheader("🎯 Filtrelenmiş Sonuçlar")
-        st.info(f"Toplam {len(res)} kişi, Türkiye standartlarına göre doğrulandı.")
-        st.dataframe(res, height=600)
-        
-        # Excel İndir
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            res.to_excel(writer, index=False, sheet_name='Strict Turkish Leads')
-            
-        st.download_button(
-            label="📥 Excel İndir (Strict Mode)",
-            data=buffer.getvalue(),
-            file_name="turkish_leads_strict.xlsx",
-            mime="application/vnd.ms-excel"
+def extract_info_with_gpt(raw_title: str, snippet: str, client: OpenAI) -> dict:
+    """Google sonucundan kişi / ünvan / şirket ayıklar."""
+    prompt = f"""
+Aşağıdaki veriden Kişi, Ünvan ve Şirket bilgisini çıkar.
+
+GİRDİ:
+Title: {raw_title}
+Snippet: {snippet}
+
+KURALLAR:
+- Sadece JSON döndür.
+- Şirketi mümkünse "at" / "@" / "-" gibi ayırıcılardan yakala.
+- Bulamazsan "Bilinmiyor" yaz.
+
+JSON:
+{{
+  "name": "Ad Soyad",
+  "role": "Ünvan",
+  "company": "Şirket Adı"
+}}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
         )
+        return json.loads(resp.choices[0].message.content)
+    except Exception:
+        return {"name": "Bilinmiyor", "role": "Bilinmiyor", "company": "Bilinmiyor"}
+
+
+def apollo_people_match(api_key: str, linkedin_url: str | None, name: str | None, domain: str | None,
+                       reveal_personal: bool, reveal_phone: bool):
+    """
+    Apollo match:
+    1) linkedin_url ile dene
+    2) name+domain ile dene
+    """
+    if not api_key:
+        return "API Key Yok", "❌ Apollo API Key yok"
+
+    headers = {
+        "Content-Type": "application/json",
+        "accept": "application/json",
+        "X-Api-Key": api_key
+    }
+
+    params = {
+        "reveal_personal_emails": str(reveal_personal).lower(),
+        "reveal_phone_number": str(reveal_phone).lower()
+    }
+
+    # 1) LinkedIn match
+    if linkedin_url:
+        payload = {"linkedin_url": linkedin_url}
+        try:
+            status, data = safe_post(APOLLO_MATCH_URL, headers=headers, payload=payload, params=params, timeout=30)
+            if status < 400:
+                person = data.get("person")
+                if person:
+                    email = person.get("email")
+                    if email:
+                        return email, "✅ Eşleşti (LinkedIn)"
+                    return "Mail Yok", "⚠️ Profil Var, Mail Yok"
+            else:
+                # Apollo hata döndürürse görmek için aşağıda status'a yazarız
+                pass
+        except Exception:
+            pass
+
+    # 2) Name + domain match
+    if not (name and domain):
+        if not domain:
+            return "Domain Yok", "❌ Domain bulunamadı"
+        return "İsim Yok", "❌ İsim parse edilemedi"
+
+    parts = name.split()
+    first_name = parts[0] if parts else ""
+    last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    payload = {
+        "first_name": first_name,
+        "last_name": last_name,
+        "domain": domain  # <-- doğru alan
+    }
+
+    try:
+        status, data = safe_post(APOLLO_MATCH_URL, headers=headers, payload=payload, params=params, timeout=30)
+        if status >= 400:
+            return "Hata", f"API Hatası (HTTP {status})"
+        person = data.get("person")
+        if person:
+            email = person.get("email")
+            if email:
+                return email, "✅ Eşleşti (Name+Domain)"
+            return "Mail Yok", "⚠️ Profil Var, Mail Yok"
+        return "Bulunamadı", "❌ Eşleşme Yok"
+    except Exception as e:
+        return "Hata", f"API Hatası: {str(e)}"
+
+
+# -----------------------------
+# APP
+# -----------------------------
+def run_app():
+    if not (openai_api_key and serper_api_key and apollo_api_key):
+        st.warning("⚠️ OpenAI + Serper + Apollo API key'lerini gir.")
+        return
+
+    if st.button("🚀 Taramayı Başlat", type="primary"):
+        client = OpenAI(api_key=openai_api_key)
+        status_box = st.status("İşlem başlıyor...", expanded=True)
+
+        # 1) Google/Serper search
+        status_box.write("🔍 Google/Serper ile LinkedIn profilleri aranıyor...")
+        results = google_search_linkedin(
+            target_position,
+            target_industry,
+            target_location,
+            serper_api_key,
+            search_limit
+        )
+
+        if "error" in results:
+            status_box.update(label="Hata!", state="error")
+            st.error(results["error"])
+            if "details" in results:
+                st.json(results["details"])
+            return
+
+        organic = results.get("organic", [])
+        if not organic:
+            status_box.update(label="Hata!", state="error")
+            st.error("Google sonuçları boş döndü.")
+            return
+
+        processed = []
+        total = len(organic)
+        progress = status_box.progress(0)
+
+        for i, item in enumerate(organic, start=1):
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            linkedin_url = item.get("link")
+
+            status_box.write(f"🧠 Analiz: {i}/{total}")
+
+            # 2) GPT parse
+            parsed = extract_info_with_gpt(title, snippet, client)
+            name = parsed.get("name", "Bilinmiyor")
+            role = parsed.get("role", "Bilinmiyor")
+            company = parsed.get("company", "Bilinmiyor")
+
+            # 3) Domain
+            domain = find_company_domain(company, serper_api_key) if company != "Bilinmiyor" else None
+
+            # 4) Apollo match
+            email, apollo_status = apollo_people_match(
+                api_key=apollo_api_key,
+                linkedin_url=linkedin_url,
+                name=name if name != "Bilinmiyor" else None,
+                domain=domain,
+                reveal_personal=reveal_personal_emails,
+                reveal_phone=reveal_phone_number
+            )
+
+            processed.append({
+                "Ad Soyad": name,
+                "Ünvan": role,
+                "Şirket": company,
+                "Domain": domain or "",
+                "E-Posta": email,
+                "Durum": apollo_status,
+                "LinkedIn URL": linkedin_url or ""
+            })
+
+            progress.progress(i / total)
+
+        status_box.update(label="✅ Tamamlandı!", state="complete", expanded=False)
+
+        df = pd.DataFrame(processed)
+        st.subheader(f"📋 Sonuçlar ({len(df)} Kayıt)")
+
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "LinkedIn URL": st.column_config.LinkColumn("Profil"),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+        # Excel Export
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            edited_df.to_excel(writer, index=False, sheet_name="Leads")
+
+        st.download_button(
+            label="📥 Excel İndir",
+            data=output.getvalue(),
+            file_name="Leads_Apollo_Match.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+
+
+if __name__ == "__main__":
+    run_app()
